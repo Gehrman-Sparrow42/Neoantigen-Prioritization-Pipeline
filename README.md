@@ -2,321 +2,222 @@
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://opensource.org/licenses/MIT)
-[![Field: Computational Immuno-Oncology](https://img.shields.io/badge/Field-Computational%20Immuno--Oncology-purple.svg)]()
-[![Data Source: TCGA PanCancer](https://img.shields.io/badge/Data%20Source-TCGA%20PanCancer%20Atlas-orange.svg)](https://gdc.cancer.gov/about-data/publications/pancanatlas)
-[![Tests: 9 Passed](https://img.shields.io/badge/tests-9%20passed-success.svg)]()
 
-A clinical-grade, modular, high-throughput computational pipeline and **interactive clinical dashboard for in silico neoantigen discovery, Deep Neural Network (DNN) HLA Class I presentation modeling, and personalized cancer vaccine payload prioritization**.
+NeoScorer is a research prototype for ranking candidate HLA Class I peptides from pre-annotated somatic mutations and gene-level expression values. It includes a command-line pipeline and a local dashboard for exploring reports from multiple patients.
 
-Bridges raw patient multi-omics sequencing (Whole-Exome Sequencing + RNA-seq) directly to clinically actionable, ranked mRNA/peptide vaccine formulations.
+The workflow filters missense variants, resolves protein sequences, generates mutant and wild-type 9-mers, runs selectable predictors, and applies a heuristic ranking score. It does not process raw WES/RNA-seq reads or produce validated vaccine formulations. Predictions and tiers are exploratory; no experimental or clinical validation of this pipeline is documented in the repository.
 
----
+## Contents
 
-## Table of Contents
-- [Abstract](#abstract)
-- [Biological Principles](#biological-principles)
-- [Pipeline Architecture & Workflow](#pipeline-architecture--workflow)
-- [Mathematical Scoring Model](#mathematical-scoring-model)
-- [Clinical Case Study: Metastatic Melanoma (TCGA-D3-A1Q1)](#clinical-case-study-metastatic-melanoma-tcga-d3-a1q1)
-- [Interactive Multi-Patient Dashboard](#interactive-multi-patient-dashboard)
-- [Repository Structure](#repository-structure)
-- [Quickstart & CLI Usage](#quickstart--cli-usage)
-- [Automated Testing](#automated-testing)
-- [Data Provenance & Citations](#data-provenance--citations)
+- [Implemented workflow](#implemented-workflow)
+- [Scoring and interpretation](#scoring-and-interpretation)
+- [Bundled TCGA example](#bundled-tcga-example)
+- [Local dashboard](#local-dashboard)
+- [Repository structure](#repository-structure)
+- [Quickstart and CLI](#quickstart-and-cli)
+- [Limitations](#limitations)
+- [Verification](#verification)
+- [Data provenance and references](#data-provenance-and-references)
 
----
+## Implemented workflow
 
-## Abstract
+1. **Read and validate JSON inputs.** Mutation records use a cBioPortal-compatible schema with gene identifiers, mutation type, protein change, and tumor alternate/reference read counts. Expression maps Entrez gene IDs to finite, non-negative values. Patient identity is inferred from mutations or supplied explicitly.
+2. **Filter missense variants by expression.** The default cutoff is `1.0`. Missing gene-expression entries are treated as zero and filtered at this cutoff. The code calls this quantity TPM, but users must verify input units; see [limitations](#limitations).
+3. **Resolve protein context.** A local cache or UniProt reviewed human sequence search supplies a gene-level reference sequence. Resolution checks the one-based protein position and reference residue, then extracts up to ten residues on each side. Unresolved sequences, unsupported protein-change strings, out-of-range positions, and residue mismatches share an exclusion counter. Uncached genes are prefetched with up to 16 workers.
+4. **Generate and score peptides.** Sliding windows retain 9-mers spanning the altered residue, paired with wild-type sequences. One HLA allele is evaluated per run, defaulting to `HLA-A*02:01`.
+5. **Select and rank.** The lowest predicted mutant IC50 selects one peptide per screened variant. The composite score then ranks these representatives. Reports contain all selected variants, including deprioritized rows; `--top` only limits console output.
+6. **Export and explore.** Current runs write a TSV and JSON metadata sidecar. The dashboard discovers reports, plots metrics, filters/sorts candidates, exports CSV/TSV, and runs one background pipeline job at a time.
 
-Personalized cancer vaccines (such as patient-specific mRNA or synthetic long peptide formulations) require selecting a restricted payload (typically 10 to 20 candidate epitopes) from hundreds of somatic mutations identified via next-generation sequencing. 
+### Predictor modes
 
-The **Neoantigen-Prioritization-Pipeline** automates this selection by systematically integrating four orthogonal biological dimensions:
-1. **Somatic Clonality**: Variant Allele Frequency (VAF) from tumor-normal Whole-Exome Sequencing (WES).
-2. **Transcriptional Availability**: Normalized Transcripts Per Million (TPM) from matched patient RNA-seq.
-3. **MHC-I Presentation Stability**: Dual-model consensus deep learning (**MHCflurry 2.0** + **NetMHCpan-4.1**) modeling stereochemical groove binding affinity ($IC_{50}\text{ nM}$), antigen processing/cleavage, and Monte Carlo Percentile Ranks ($Rank\%$).
-4. **Agretopicity (Differential Foreignness)**: Mutant versus wild-type differential binding affinity ($AI = IC_{50}^{WT} / IC_{50}^{MT}$) to maximize immunogenicity while minimizing self-tolerance and autoimmune risk.
+| Mode | Current implementation |
+| --- | --- |
+| `ensemble` (default) | MHCflurry scores all unique peptides. NetMHCpan is requested for each variant's best MHCflurry mutant peptide and its wild-type partner, plus pairs with mutant MHCflurry IC50 ≤2,500 nM. Available paired predictions are combined. Other peptides retain MHCflurry results with source `MHCflurry_Filter_NonBinder`. |
+| `mhcflurry` | Local `Class1PresentationPredictor`, returning affinity, integrated presentation score, and presentation percentile. Requires separately installed model weights. |
+| `netmhcpan` | IEDB MHC-I API requests using `method=netmhcpan_ba`, with a persistent cache. The wrapper labels results NetMHCpan-4.1 but does not pin the remote service version. |
+| `pwm` | Hand-specified position weight matrix and heuristic affinity/rank mappings for HLA-A*02:01 9-mers. An illustrative baseline, without documented empirical calibration. |
 
----
+MHCflurry's presentation score combines affinity and processing predictions ([official documentation](https://openvax.github.io/mhcflurry/api.html)). This pipeline supplies peptides without flanking context to the model and does not export separate cleavage or TAP transport probabilities. Combining predictors here is a project-defined heuristic, not independent validation of presentation or immunogenicity.
 
-## Biological Principles
+## Scoring and interpretation
 
-```
-  TUMOR CELL (Intracellular)               CELL SURFACE                    IMMUNE SYSTEM
-┌────────────────────────────┐        ┌──────────────────────┐        ┌──────────────────────┐
-│ DNA: Somatic Point Typo    │        │  HLA Class I Groove  │        │  CD8+ Cytotoxic      │
-│  └─> mRNA Transcription    │ ──────>│  (Pockets B & F)     │ ──────>│  T-Cell Receptor     │
-│  └─> Proteasome Cleavage   │        │  Cradles 9-mer       │        │  (TCR Recognition)   │
-│  └─> Neopeptide Generation │        │  Mutant Epitope      │        │  Triggers Cell Death │
-└────────────────────────────┘        └──────────────────────┘        └──────────────────────┘
-```
+The CLI uses functions in `src/prioritizer.py` to calculate:
 
-1. **The Transcriptional Gate**: Somatic mutations frequently occur in epigenetically silenced or non-expressed genomic regions. A mutation cannot be translated, cleaved, or loaded onto HLA if its source transcript has zero expression ($TPM < 1.0$).
-2. **Anchor Pockets on HLA-A\*02:01**: The Class I closed peptide-binding groove predominantly accommodates 9-amino-acid peptides (9-mers). Primary anchor residues at **Position 2** (Pocket B, favoring Leucine/Methionine/Valine) and **Position 9** (Pocket F, favoring Valine/Leucine) dictate physical presentation stability.
-3. **Clonality and Tumor Heterogeneity**: Vaccines targeting subclonal mutations ($AF \ll 0.20$) allow unmutated tumor clones to escape. Prioritizing clonal driver mutations ($AF \to 0.50$ in diploid tumors) ensures tumor-wide immune eradication.
-4. **Consensus Deep Learning**: Single neural networks are prone to model-specific false positives. Combining **MHCflurry 2.0** (antigen processing and TAP transport) with **NetMHCpan-4.1** (pan-allele surface presentation) ensures robust dual-validated candidates.
+$$S_{neo} = \operatorname{round}\left(\min\left(100, C_{AF} E_{TPM} P_{MHC} A_{bonus} \times 20\right),1\right)$$
 
----
+These are heuristic weights, not fitted probabilities of T-cell response. Scores can saturate at 100 and are not calibrated for comparisons across patients.
 
-## Pipeline Architecture & Workflow
+### Allele-frequency term
 
-```text
-┌──────────────────────────────────────────────────────────────────────────────────┐
-│ STAGE 1: Multi-Omics Patient Data Ingestion                                      │
-│  * WES Somatic Calls: Mutation types, read counts (Alt/Total), VAF calculation   │
-│  * Matched RNA-seq: Gene-level RSEM / TPM abundance quantification                │
-└────────────────────────────────────────┬─────────────────────────────────────────┘
-                                         │
-                                         ▼
-┌──────────────────────────────────────────────────────────────────────────────────┐
-│ STAGE 2: RNA-seq Expression Gating                                               │
-│  * Filter: Drop silent/unexpressed loci (Threshold: TPM >= 1.0)                  │
-│  * Reduces downstream search space by 60% - 80%                                  │
-└────────────────────────────────────────┬─────────────────────────────────────────┘
-                                         │
-                                         ▼
-┌──────────────────────────────────────────────────────────────────────────────────┐
-│ STAGE 3: Dynamic UniProt Proteome Resolution & Context Extraction                 │
-│  * 16-worker multi-threaded prefetching from UniProtKB Swiss-Prot                │
-│  * Translates 1-based clinical coordinates to 0-based sequence indices           │
-│  * Strict reference residue verification (rejects alternative splice mismatches) │
-│  * Extracts 21-mer flanking windows (10 aa upstream + MUT + 10 aa downstream)    │
-└────────────────────────────────────────┬─────────────────────────────────────────┘
-                                         │
-                                         ▼
-┌──────────────────────────────────────────────────────────────────────────────────┐
-│ STAGE 4: High-Throughput 9-mer Slicing & Deep Neural Network Ensemble            │
-│  * Slices all overlapping 9-mers spanning the somatic alteration                 │
-│  * Local PyTorch MHCflurry 2.0 (groove affinity + antigen processing/cleavage)    │
-│  * Official NIH IEDB NetMHCpan-4.1 (pan-allele neural network + Percentile Rank) │
-│  * Geometric consensus IC50 & Arithmetic consensus Percentile Rank calculation   │
-└────────────────────────────────────────┬─────────────────────────────────────────┘
-                                         │
-                                         ▼
-┌──────────────────────────────────────────────────────────────────────────────────┐
-│ STAGE 5: Multi-Parametric Prioritization & Clinical Payload Formulation          │
-│  * Multiplies Clonality * Expression * Presentation * Agretopicity Bonus         │
-│  * Assigns Clinical Actionability Tiers (Tier 1: Vaccine, Tier 2: Backup)        │
-│  * Exports verified Clinical Prescription Table (TSV) & JSON metadata sidecar    │
-│  * Interactive Clinical Web Dashboard & Visual Analytics (FastAPI + Chart.js)   │
-└──────────────────────────────────────────────────────────────────────────────────┘
-```
+$$AF = \frac{\text{tumor alternate reads}}{\max(1,\text{alternate reads}+\text{reference reads})}$$
+$$C_{AF} = \min(1,\max(0,2AF))$$
 
----
+This is a VAF-based proxy. The pipeline does not correct for tumor purity or copy number and does not estimate cancer-cell fraction. A zero-read record yields AF zero.
 
-## Mathematical Scoring Model
+### Expression term
 
-The final **Immunogenicity Prioritization Score** ($S_{neo}$, scaled $0 - 100$) integrates four multiplicative biological terms:
+$$E_{TPM} = \log_2(1+\max(0,x))$$
 
-$$S_{neo} = C_{AF} \times E_{TPM} \times P_{MHC} \times A_{bonus} \times 20.0$$
+Here $x$ is the supplied gene-expression value. The historical variable/column name is TPM; the bundled fetcher does not verify or convert expression units. Gene-level expression does not establish expression of the mutant allele.
 
-### 1. Clonality Score ($C_{AF}$)
-In diploid human tumor genomes, a heterozygous somatic alteration present in 100% of malignant cells yields an allele frequency $AF \approx 0.50$:
-$$C_{AF} = \min(1.0, \max(0.0, 2.0 \times AF))$$
+### Affinity-derived term
 
-### 2. Transcriptional Abundance Score ($E_{TPM}$)
-Logarithmic transformation reflecting saturating biological antigen availability:
-$$E_{TPM} = \log_2(1.0 + \text{TPM})$$
+$$P_{MHC} = \max\left(0,\min\left(1,1-\frac{\log_{10}(\min(50000,\max(1,IC_{50})))}{\log_{10}(50000)}\right)\right)$$
 
-### 3. MHC-I Presentation Probability ($P_{MHC}$)
-Calibrated transformation of consensus $IC_{50}$ dissociation constant (nM) normalized to the standard 50,000 nM ceiling:
-$$P_{MHC} = 1.0 - \frac{\log_{10}(\text{clamped } IC_{50})}{\log_{10}(50000)}$$
-* $IC_{50} \le 50\text{ nM}$ (Strong Binder) $\to P_{MHC} \ge 0.65$
-* $IC_{50} \approx 500\text{ nM}$ (Weak Binder threshold) $\to P_{MHC} \approx 0.43$
-* $IC_{50} > 10,000\text{ nM}$ (Non-Binder) $\to P_{MHC} < 0.15$
+This is an affinity transformation, not a calibrated presentation probability. It is separate from the MHCflurry `Presentation_Score` exported in the TSV. Predicted IC50 values are in nM; lower values indicate stronger predicted binding. Affinity-only classes use ≤50 nM for strong, >50 to ≤500 nM for weak, and >500 nM for non-binders.
 
-### 4. Agretopicity Foreignness Factor ($A_{bonus}$)
-Evaluates the ratio of wild-type to mutant binding affinity ($AI = IC_{50}^{WT} / IC_{50}^{MT}$):
-* If $AI \ge 1.0$ (Gain-of-Binding mutation):
-  $$A_{bonus} = \min(1.50, 1.0 + 0.15 \times \log_2(AI + 1.0))$$
-* If $AI < 1.0$ (Loss of affinity compared to self):
-  $$A_{bonus} = \max(0.75, 0.90 + 0.10 \times AI)$$
+### Mutant/wild-type affinity ratio
 
-### 5. Consensus Ensemble Equations
-$$\text{Ensemble IC}_{50} = \sqrt{\text{IC}_{50}^{\text{MHCflurry}} \times \text{IC}_{50}^{\text{NetMHCpan}}}$$
-$$\text{Consensus Rank \%} = \frac{\text{Rank}_{\text{MHCflurry}} + \text{Rank}_{\text{NetMHCpan}}}{2}$$
+$$AI = \frac{IC_{50}^{WT}}{\max(0.01,IC_{50}^{MT})}$$
 
----
+For $AI \ge 1$:
 
-## Clinical Case Study: Metastatic Melanoma (TCGA-D3-A1Q1)
+$$A_{bonus} = \min(1.5,1+0.15\log_2(AI+1))$$
 
-The pipeline was validated against authentic clinical patient data from **The Cancer Genome Atlas (TCGA) Skin Cutaneous Melanoma cohort** (*Cell*, 2018):
+For $AI < 1$:
 
-### Exome Screening Funnel
-| Metric | Count | Biological Significance |
-| :--- | :--- | :--- |
-| **Total Somatic Mutations (WES)** | **486** | High tumor mutation burden typical of UV-induced melanoma |
-| **Missense Alterations** | **410** | Non-synonymous single-amino-acid changes |
-| **Eliminated by RNA Gate ($TPM < 1.0$)** | **66** | Transcriptionally silent genes (e.g. *ALPP*, *CXCR5*) safely dropped |
-| **Filtered by Isoform / QC boundary** | **18** | Alternative splice discrepancies safely flagged |
-| **Candidate 9-mers Screened** | **2,912** | Overlapping peptide windows evaluated against HLA-A\*02:01 |
-| **Strong Binders ($IC_{50} \le 50\text{ nM}$ or $Rank \le 0.5\%$)** | **28** | Dual-consensus high-affinity surface presentation candidates |
-| **Weak Binders ($50 - 500\text{ nM}$)** | **51** | Viable secondary/backup presentation pool |
+$$A_{bonus} = \max(0.75,0.90+0.10AI)$$
 
-### Top Recommended Vaccine Payload (Consensus Ensemble)
-```text
-Rank  Gene       Mutation   Neopeptide   AF     RNA TPM   IC50 (nM)   Rank %   Agret.    Score   Clinical Tier
------------------------------------------------------------------------------------------------------------------------------
-#1    AP4B1      G525V      LLLVVIDEV    0.65   325.3     17.8        0.14%    0.81x     100.0   Tier 1: Vaccine Payload
-#2    TNFRSF10B  R145L      FLEEDSPEM    0.20   879.7     24.0        0.10%    340.78x   82.9    Tier 1: Vaccine Payload
-#3    TMEM245    G754W      FLWTYWAAV    0.15   1634.3    4.3         0.04%    1.25x     64.3    Tier 1: Vaccine Payload
-#4    PCNX3      L1607I     SLEPFIYGL    0.18   1194.8    22.8        0.16%    1.07x     61.2    Tier 1: Vaccine Payload
-#5    GPR158     L535F      RMLAVILFV    0.13   2328.6    5.1         0.02%    1.29x     59.8    Tier 1: Vaccine Payload
-#6    PML        S388Y      RLQDLSYCI    0.12   1176.6    18.0        0.12%    7.28x     52.3    Tier 1: Vaccine Payload
-```
+The ratio measures predicted differential binding. It does not measure TCR recognition, self-tolerance, or autoimmune risk.
 
-> **Key Biological Insights from Deep Learning**:
-> - **`TNFRSF10B R145L` (`FLEEDSPEM`)**: Introduces a canonical Leucine anchor at Pocket B (Position 2), converting an unpresentable wild-type ($IC_{50} = 8,185\text{ nM}$) into a high-affinity neoepitope ($IC_{50} = 24.0\text{ nM}$)—a remarkable **340.78× Agretopicity gain-of-affinity**.
-> - **Elimination of Matrix Artifacts (`NRAS G12R`)**: Simple position weight matrices falsely favor Arginine at position 7. The Deep Neural Network correctly recognized that the bulky, positively charged Arginine disrupts hydrophobic groove packing ($IC_{50} = 4,599\text{ nM}$), safely preventing an unpresentable decoy from entering the vaccine payload.
+### Combined predictions and tiers
 
----
+When paired model results are available, the ensemble uses:
 
-## Interactive Multi-Patient Dashboard
+$$IC_{50}^{combined}=\sqrt{\max(0.01,IC_{50}^{MHCflurry})\max(0.01,IC_{50}^{NetMHCpan})}$$
+$$Rank^{combined}=\frac{Rank^{MHCflurry}+Rank^{NetMHCpan}}{2}$$
 
-A production-grade, local web dashboard (FastAPI + Vanilla JS + Chart.js) is included for interactive exploration, multi-patient cohort management, and clinical formulation review.
+MHCflurry presentation percentiles and NetMHCpan binding-affinity percentiles describe different outputs. Their arithmetic mean has no documented calibration. The MHCflurry integrated presentation score is retained, rather than averaged.
+
+The active CLI in `run_pipeline.py` assigns Tier 1 when score ≥50 **and** mutant IC50 ≤50 nM, Tier 2 when score ≥25 **and** mutant IC50 ≤500 nM (after Tier 1), and Tier 3 otherwise. These are implementation thresholds, not clinical actionability categories. The separate `score_and_rank_candidates` helper uses a different Tier 2 rule (`or`); it is not the CLI's tier-assignment path.
+
+Existing filenames and output fields retain terms such as `clinical_vaccine_prescription`, `ClinicalTier`, `Vaccine Payload`, and `INCLUDE`/`REJECT`. These are legacy software labels, not prescriptions or treatment recommendations. A high score alone does not imply a high priority tier: expression can raise the score of a weakly binding peptide.
+
+## Bundled TCGA example
+
+The repository includes mutation and expression JSONs for sample `TCGA-D3-A1Q1-06` from the cBioPortal TCGA SKCM PanCancer Atlas study, and a saved report for `TCGA-D3-A1Q1`. This is a worked example using public cancer data, not a validation cohort or evidence of vaccine efficacy. The default HLA-A*02:01 setting is an analysis assumption; the inputs do not establish this patient's HLA genotype.
+
+These counts can be read from the bundled inputs and TSV without rerunning prediction:
+
+| Quantity | Count | Interpretation |
+| --- | ---: | --- |
+| Input mutation records | 486 | Supplied annotated variants, not a measured mutation burden per megabase |
+| Missense records | 410 | Variants eligible for this workflow |
+| Missense records below expression cutoff 1.0 | 66 | Includes missing entries treated as zero |
+| Saved report rows | 326 | One representative peptide per exported variant |
+| Affinity-only strong binders | 28 | Mutant IC50 ≤50 nM |
+| Affinity-only weak binders | 51 | Mutant IC50 >50 and ≤500 nM |
+| Dashboard strong-binder count | 29 | IC50 ≤50 nM **or** rank in 0–0.5%; a different definition |
+| Saved Tier 1 / Tier 2 / Tier 3 rows | 6 / 35 / 285 | Recorded heuristic assignments |
+| Rows labeled combined / MHCflurry-only filtered | 211 / 115 | Not every row contains two model predictions |
+
+The saved TSV has no JSON sidecar or explicit `HLA_Allele` column. Current runs add both. Historical claims of 18 QC exclusions and 2,912 candidate windows are not recorded in this report's metadata, so they are not presented as verified funnel statistics.
+
+These six rows carry Tier 1 labels in the saved report. Rank is their position in the full score-sorted report, not a new ranking of this subset:
+
+| Saved rank | Gene | Change | Mutant 9-mer | Score |
+| ---: | --- | --- | --- | ---: |
+| 1 | AP4B1 | G525V | LLLVVIDEV | 100.0 |
+| 4 | TNFRSF10B | R145L | FLEEDSPEM | 82.9 |
+| 7 | TMEM245 | G754W | FLWTYWAAV | 64.3 |
+| 8 | PCNX3 | L1607I | SLEPFIYGL | 61.2 |
+| 9 | GPR158 | L535F | RMLAVILFV | 59.8 |
+| 12 | PML | S388Y | RLQDLSYCI | 52.3 |
+
+For example, the saved TNFRSF10B row has a predicted wild-type/mutant affinity ratio of 340.78. This is a model output, not measured binding or demonstrated T-cell recognition. The repository does not establish structural mechanisms or prove that excluded peptides are biologically unpresentable.
+
+## Local dashboard
+
+The FastAPI application uses vanilla JavaScript and bundled Chart.js. Existing reports can be explored without a frontend build or internet connection. Features include patient discovery/switching, expression/affinity and mutant/wild-type charts, search, tier filters, multi-column sorting, model evidence cards, CSV/TSV export, and background runs from selected or uploaded JSON inputs.
+
+It binds to `127.0.0.1:8520` and supports one active job per server. It is a local single-operator application without the authentication, audit infrastructure, or validation of a deployed clinical service. See [DASHBOARD.md](DASHBOARD.md) for input schemas, report interpretation, job behavior, and verification commands.
+
+## Repository structure
 
 ```text
-┌────────────────────────────────────────────────────────────────────────────────────────┐
-│  NeoScorer · PRECISION IMMUNO-ONCOLOGY                   [ Active Patient: TCGA-D3-A1Q1 ▼ ] ↻ │
-├────────────────────────────────────────────────────────────────────────────────────────┤
-│  [Alterations: 326]    [Strong Binders: 28]    [Tier 1 Payload: 6]    [Secondary: 35]  │
-├────────────────────────────────────────────────────┬───────────────────────────────────┤
-│  EXPRESSION × PRESENTATION LANDSCAPE               │  MUTANT / WILD-TYPE AGRETOPICITY  │
-│  (Interactive Bubble Scatter: TPM vs IC50 vs VAF)  │  (Log-scale bar chart: MT vs WT)  │
-├────────────────────────────────────────────────────┴───────────────────────────────────┤
-│  CLINICAL VACCINE PRESCRIPTION EXPLORER                  [⌕ Search] [Tier: All ▼] [↓ Export] │
-│  Rank | Gene | Mutation | Neopeptide | VAF | TPM | IC50 (nM) | Rank% | Agret. | Tier     │
-├────────────────────────────────────────────────────────────────────────────────────────┤
-│  PREDICTION CONSENSUS EVIDENCE CARD (Selected Candidate)                                │
-│  MHCflurry 2.0 (Groove + Cleavage) ↔ NetMHCpan-4.1 (IEDB Pan-Allele Presentation)       │
-└────────────────────────────────────────────────────────────────────────────────────────┘
+data/                    # Bundled example inputs and protein/prediction caches
+reports/                 # Saved TSV; new runs also write JSON metadata
+src/
+  data_models.py         # Variant/context dataclasses
+  protein_resolver.py    # Gene-level protein lookup and residue checks
+  hla_scorer.py          # 9-mer generation and HLA-A*02:01 PWM baseline
+  dnn_predictor.py        # MHCflurry and IEDB predictor wrappers
+  scale_hla_screener.py  # Expression filtering, peptide screening and selection
+  prioritizer.py         # Heuristic scoring functions
+scripts/                 # cBioPortal fetcher and input inspection utility
+dashboard_backend/       # Report parsing, discovery and background jobs
+dashboard_static/        # Frontend and bundled Chart.js
+tests/test_dashboard.py  # API, identity, exports and job regression tests
+patient_io.py            # Shared input validation and report naming
+run_pipeline.py          # CLI scoring, tier assignment and output generation
+dashboard.py             # Local web entrypoint
+requirements.txt         # Runtime dependencies
+requirements-dev.txt     # Development/test dependencies
+DASHBOARD.md             # Dashboard operation and technical details
 ```
 
-### Key Features:
-- **Dynamic Patient Discovery**: Automatically scans `reports/` for all patient prescription reports; seamlessly switch between patients via the navbar dropdown.
-- **Interactive Visualizations**: Four-quadrant immuno-oncology scatter plots and logarithmic agretopicity bar charts (bundled locally with zero CDN dependencies).
-- **Candidate Filtering & Multi-Level Sorting**: Instant search by gene, mutation, or peptide sequence; filter by clinical tier; Shift-click table headers for multi-level sorting.
-- **Model Consensus Audit**: Inspect individual MHCflurry and NetMHCpan predictions for any selected candidate.
-- **"Run New Patient" Interface**: Upload or select patient WES/RNA-seq JSONs and execute the background pipeline with streaming console logs.
-- **One-Click Export**: Download filtered prescriptions as clinical CSV or TSV files.
+## Quickstart and CLI
 
----
+Use Python 3.10+ and an environment compatible with the predictor dependencies. In this `C:\Tools` workspace, use the shared environment at `C:\Tools\.venv` by default. From the project directory:
 
-## Repository Structure
-
-```text
-Neoantigen-Prioritization-Pipeline/
-├── data/                                    # Multi-omics inputs & reference caches
-│   ├── real_patient_TCGA-D3-A1Q1-06_mutations.json   # 486 WES somatic variant calls
-│   ├── real_patient_TCGA-D3-A1Q1-06_expression.json  # Matched RNA-seq TPM values
-│   ├── protein_cache.json                   # Local cache of 305+ UniProt protein sequences
-│   └── netmhcpan_cache.json                 # Persistent cache of NIH IEDB NetMHCpan queries
-├── reports/                                 # Clinical outputs
-│   ├── TCGA_D3_A1Q1_clinical_vaccine_prescription.tsv # Formatted prescription table
-│   └── TCGA_D3_A1Q1_clinical_vaccine_prescription.json # Patient sidecar metadata
-├── dashboard_backend/                       # Local dashboard server modules
-│   ├── __init__.py
-│   ├── jobs.py                              # Asynchronous pipeline execution & queueing
-│   └── reports.py                           # Dynamic patient discovery, parsing & filtering
-├── dashboard_static/                        # Self-contained frontend assets
-│   ├── index.html                           # Accessible semantic dashboard UI
-│   ├── styles.css                           # Modern slate/emerald dark theme tokens
-│   ├── app.js                               # Patient state management & grid controller
-│   ├── charts.js                            # Interactive Chart.js analytics
-│   ├── data.js                              # Client API bindings
-│   └── vendor/chart.umd.js                  # Bundled offline Chart.js v4.4.8
-├── scripts/                                 # Auxiliary data utilities
-│   ├── fetch_patient_data.py                # Ingestion client for cBioPortal REST API
-│   └── inspect_patient.py                   # Multi-omics data profiler
-├── src/                                     # Core scientific engine
-│   ├── __init__.py
-│   ├── data_models.py                       # Dataclasses and coordinate conversions
-│   ├── dnn_predictor.py                     # Deep Neural Network engine (MHCflurry + NetMHCpan)
-│   ├── protein_resolver.py                  # Multi-threaded UniProt REST API sequence resolver
-│   ├── hla_scorer.py                        # 9-mer sliding window & HLA-A*02:01 PWM model
-│   ├── prioritizer.py                       # Multi-parametric scoring mathematics
-│   └── scale_hla_screener.py                # Exome screening funnel orchestrator
-├── tests/                                   # Automated regression test suite
-│   └── test_dashboard.py                    # Pytest suite for API, jobs, and exports
-├── dashboard.py                             # FastAPI dashboard entrypoint (loopback-only)
-├── patient_io.py                            # Shared input validation & file naming logic
-├── run_pipeline.py                          # Master CLI pipeline entrypoint
-├── requirements.txt                         # Runtime dependencies (torch, mhcflurry, fastapi)
-├── requirements-dev.txt                     # Test dependencies (pytest)
-├── DASHBOARD.md                             # Technical architecture documentation for dashboard
-├── .gitignore
-└── README.md
+```powershell
+& "C:\Tools\.venv\Scripts\python.exe" -m pip install -r requirements.txt
+& "C:\Tools\.venv\Scripts\python.exe" dashboard.py --open-browser
 ```
 
----
+On Windows the existing workspace launcher is `C:\Tools\LAUNCHERS\Launch_NeoScorer_Dashboard.bat`. Outside this workspace, substitute your Python interpreter. Installing packages alone does not install MHCflurry model weights; follow the [MHCflurry installation instructions](https://openvax.github.io/mhcflurry/intro.html) for the presentation bundle required by `Class1PresentationPredictor`.
 
-## Quickstart & CLI Usage
+Run the example through the CLI:
 
-### Prerequisites
-* Python 3.10+ (Tested on Python 3.13 Windows 64-bit AMD64).
-* Install dependencies:
-```bash
-pip install -r requirements.txt
+```powershell
+& "C:\Tools\.venv\Scripts\python.exe" run_pipeline.py `
+  --mutations data/real_patient_TCGA-D3-A1Q1-06_mutations.json `
+  --expression data/real_patient_TCGA-D3-A1Q1-06_expression.json `
+  --hla "HLA-A*02:01" --predictor ensemble `
+  --tpm-threshold 1.0 --top 12 --output-dir reports/example_rerun
 ```
 
-### 1. Launch the Interactive Web Dashboard
-Run the dashboard and automatically open it in your browser (`http://localhost:8520`):
-```bash
-python dashboard.py --open-browser
-```
-*(Alternatively, on Windows, double-click `C:\Tools\LAUNCHERS\Launch_NeoScorer_Dashboard.bat`)*
+The separate output directory preserves the bundled report. The CLI replaces existing outputs with the same patient-derived name in its chosen directory; the dashboard refuses to overwrite existing patient reports.
 
-### 2. Run the Command-Line Pipeline Directly
-Execute the full clinical exome prioritization pipeline with the Consensus Ensemble:
-```bash
-python run_pipeline.py --predictor ensemble
-```
+| Option | Meaning and default |
+| --- | --- |
+| `--predictor` | `ensemble`, `mhcflurry`, `netmhcpan`, or `pwm`; default `ensemble` |
+| `--hla` | One target allele; default `HLA-A*02:01`. PWM supports only this allele. |
+| `--tpm-threshold` | Cutoff on the supplied expression scale; default `1.0` |
+| `--top` | Console display count, not an export limit; default `12` |
+| `--mutations`, `--expression` | Input JSON paths; default bundled example files |
+| `--patient-id` | Optional ID, inferred from mutations if omitted |
+| `--output-dir` | Report directory; default `reports/` |
 
-Customize clinical parameters via CLI arguments:
-```bash
-python run_pipeline.py \
-  --mutations data/real_patient_TCGA-D3-A1Q1-06_mutations.json \
-  --expression data/real_patient_TCGA-D3-A1Q1-06_expression.json \
-  --hla HLA-A*02:01 \
-  --predictor ensemble \
-  --tpm-threshold 1.0 \
-  --top 12
-```
+## Limitations
 
-### CLI Options:
-* `--predictor`: HLA presentation engine:
-  * `ensemble` (Default): Consensus combining local PyTorch **MHCflurry 2.0** and official NIH IEDB **NetMHCpan-4.1** via geometric mean IC50 and mean percentile rank.
-  * `mhcflurry`: Local deep neural network modeling groove affinity and antigen processing (proteasome cleavage + TAP transport).
-  * `netmhcpan`: Official NIH IEDB REST API for NetMHCpan-4.1 pan-allele artificial neural network.
-  * `pwm`: Ultra-fast position weight matrix baseline.
-* `--hla`: Target patient HLA Class I allele (default: `HLA-A*02:01`).
-* `--tpm-threshold`: Minimum RNA expression cutoff gate in TPM (default: `1.0`).
-* `--top`: Number of top-ranked vaccine candidates to display in console log (default: `12`).
-* `--mutations`: Path to input somatic mutations JSON.
-* `--expression`: Path to input RNA-seq TPM JSON.
-* `--patient-id`: Optional patient identifier (inferred from mutation file if omitted).
-* `--output-dir`: Output directory for generated prescriptions (default: `reports/`).
+- **Scientific scope:** There is no documented held-out benchmark, experimental peptide-binding/presentation assay, T-cell response validation, or clinical evaluation of this ranking. Predictor publications do not validate the pipeline's scoring weights or tiers. It does not model vaccine manufacture, delivery, dose, efficacy, or safety.
+- **Expression units and missingness:** `scripts/fetch_patient_data.py` copies values from `skcm_tcga_pan_can_atlas_2018_rna_seq_v2_mrna` without a TPM conversion. cBioPortal describes TCGA RNASeqV2 values as RSEM normalized expression ([FAQ](https://docs.cbioportal.org/user-guide/faq/)). The bundled values should not be described as verified TPM. Their scale affects the gate, scores, and chart labels. Missing entries are conflated with zero; gene-level abundance does not establish mutant-transcript abundance. Expression JSON has no patient identity, so sample matching remains the user's responsibility.
+- **Variants and reference mapping:** Only parseable single-amino-acid missense changes and 9-mers are screened. Indels, frameshifts, fusions, splice-derived peptides, other lengths, and HLA Class II are outside this implementation. UniProt lookup selects one reviewed human search result per gene, without transcript/isoform-aware mapping or pinned sequence releases. Residue matching is a local check, not full annotation validation; excluded variants may still be biologically relevant.
+- **HLA and tumor context:** One user-specified allele is used per run. There is no HLA typing, multi-allele patient aggregation, purity/copy-number correction, HLA-loss assessment, or model of antigen-processing defects. VAF and expression terms are proxies, not evidence of tumor-wide target coverage.
+- **Predictor coverage and failures:** The ensemble prefilter leaves some peptides with MHCflurry-only results. IEDB exceptions can produce fallback IC50 50,000 nM/rank 50%; missing or malformed responses can also lead to defaults downstream. Such values can influence scores and are not observed negative binding results. Combined source labels do not reliably preserve all fallback provenance. Cache keys lack model-version metadata, and dependency/service changes can change reruns.
+- **Selection and traceability:** The report saves only the best-affinity peptide per variant, not every screened window. Exclusions are aggregate counts rather than a per-variant reason log. New sidecars record filenames, parameters, timestamp and funnel statistics, but not input hashes, sequence releases, or full model/dependency versions. The bundled legacy report has less provenance.
+- **Local operation:** Viewing is local; prediction runs can send peptide sequences/HLA to IEDB and gene queries to UniProt. Inputs and logs persist under `.dashboard/jobs/`. The current protein/data fetchers disable TLS certificate verification, which limits remote-data integrity assurance. The dashboard is not designed for public exposure or a shared clinical workflow.
 
----
+## Verification
 
-## Automated Testing
+Install development dependencies if needed and run:
 
-Execute the comprehensive test suite to verify patient isolation, data validation, exports, and background workers:
-
-```bash
-pytest tests/
+```powershell
+& "C:\Tools\.venv\Scripts\python.exe" -m pip install -r requirements-dev.txt
+& "C:\Tools\.venv\Scripts\python.exe" -m pytest tests/ -q
 ```
 
----
+Existing tests cover dashboard/API behavior, patient identity, validation, filtering/export, overwrite protection, failed jobs, and a subprocess CLI run with a synthetic variant excluded by expression. They do not establish full ensemble inference correctness, scientific ranking performance, or clinical validity. See [DASHBOARD.md](DASHBOARD.md) for additional static checks and manual browser scenarios.
 
-## Data Provenance & Citations
+## Data provenance and references
 
-1. **TCGA PanCancer Atlas**:
-   * Hoadley, K. A. et al. *Cell-of-Origin Patterns Dominate the Molecular Classification of 10,000 Tumors from 33 Types of Cancer*. **Cell** 173, 291–304.e6 (2018). [doi:10.1016/j.cell.2018.03.022](https://doi.org/10.1016/j.cell.2018.03.022).
-2. **MHCflurry 2.0**:
-   * O'Donnell, T. J. et al. *MHCflurry 2.0: Improved Pan-Allele Prediction of MHC Class I-Presented Peptides by Incorporating Antigen Processing*. **Cell Systems** 11, 42–48.e7 (2020). [doi:10.1016/j.cels.2020.06.010](https://doi.org/10.1016/j.cels.2020.06.010).
-3. **NetMHCpan-4.1 (IEDB)**:
-   * Reynisson, B. et al. *NetMHCpan-4.1 and NetMHCIIpan-4.0: Improved predictions of MHC antigen presentation by concurrent motif deconvolution and integration of MS eluted ligand data*. **Nucleic Acids Research** 48, W449–W454 (2020). [doi:10.1093/nar/gkaa379](https://doi.org/10.1093/nar/gkaa379).
-4. **cBioPortal for Cancer Genomics**:
-   * Cerami, E. et al. *The cBio Cancer Genomics Portal: An Open Platform for Exploring Multidimensional Cancer Genomics Data*. **Cancer Discovery** 2, 401–404 (2012). [doi:10.1158/2159-8290.CD-12-0095](https://doi.org/10.1158/2159-8290.CD-12-0095).
-5. **UniProtKB / Swiss-Prot**:
-   * The UniProt Consortium. *UniProt: the Universal Protein Knowledgebase in 2023*. **Nucleic Acids Research** 51, D523–D531 (2023). [doi:10.1093/nar/gkac1052](https://doi.org/10.1093/nar/gkac1052).
+The fetch utility specifies cBioPortal study `skcm_tcga_pan_can_atlas_2018`, sample `TCGA-D3-A1Q1-06`, mutation profile `skcm_tcga_pan_can_atlas_2018_mutations`, and expression profile `skcm_tcga_pan_can_atlas_2018_rna_seq_v2_mrna`. Cached sequences and predictions support reuse but are not a complete reproducibility manifest.
+
+- Hoadley et al. *Cell-of-Origin Patterns Dominate the Molecular Classification of 10,000 Tumors from 33 Types of Cancer*. Cell (2018). [DOI](https://doi.org/10.1016/j.cell.2018.03.022).
+- O'Donnell et al. *MHCflurry 2.0: Improved Pan-Allele Prediction of MHC Class I-Presented Peptides by Incorporating Antigen Processing*. Cell Systems (2020). [DOI](https://doi.org/10.1016/j.cels.2020.06.010).
+- Reynisson et al. *NetMHCpan-4.1 and NetMHCIIpan-4.0: Improved predictions of MHC antigen presentation by concurrent motif deconvolution and integration of MS eluted ligand data*. Nucleic Acids Research (2020). [DOI](https://doi.org/10.1093/nar/gkaa379).
+- Cerami et al. *The cBio Cancer Genomics Portal: An Open Platform for Exploring Multidimensional Cancer Genomics Data*. Cancer Discovery (2012). [DOI](https://doi.org/10.1158/2159-8290.CD-12-0095).
+- The UniProt Consortium. *UniProt: the Universal Protein Knowledgebase in 2023*. Nucleic Acids Research (2023). [DOI](https://doi.org/10.1093/nar/gkac1052).
+
+These references describe data resources and external predictors. They are not evidence that NeoScorer produces clinically actionable vaccine candidates.

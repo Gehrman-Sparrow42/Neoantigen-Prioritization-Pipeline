@@ -16,7 +16,7 @@ The app binds only to `127.0.0.1:8520`. Use `--port 8522` for a different port. 
 
 The backend rescans `reports/*_clinical_vaccine_prescription.tsv` on every discovery request. Add a report and click the refresh button, or complete a new run. No patient ID or filename is embedded in the dashboard. The filename prefix is the discovery key; underscores display as hyphens. New pipeline outputs additionally preserve the original patient ID in a JSON sidecar.
 
-- All original prescription columns are shown. Model-specific fields appear in the selected-candidate card and remain in exports.
+- All original report columns are shown. Model-specific fields appear in the selected-candidate card and remain in exports. Legacy prescription filenames, `ClinicalTier`, and action text are software labels, not clinical recommendations.
 - Alterations screened means **rows in the report**, not the original WES count. The pipeline exports one best epitope per successfully screened variant.
 - Strong binders satisfy **positive IC50 ≤ 50 nM OR percentile between 0 and 0.5%**. The smaller affinity-only count is also shown.
 - Tier counts use recorded `ClinicalTier` assignments, never an invented payload size.
@@ -54,6 +54,12 @@ The CLI now supports `--mutations`, `--expression`, `--patient-id`, and `--outpu
 
 MHCflurry requires its installed model weights. Ensemble and NetMHCpan use NIH IEDB and transmit peptide sequences and HLA. Protein resolution can query UniProt. These existing pipeline behaviors are disclosed in the run panel. PWM supports only HLA-A*02:01 and is labeled a baseline. No patient inputs are sent by the dashboard merely for report viewing. Model inference behavior itself was not redesigned in this change.
 
+## Interpretation limits
+
+The dashboard displays saved predictions and heuristic scores. Its charts and evidence cards do not validate binding, T-cell recognition, or vaccine suitability. The expression field and chart labels say TPM, but the bundled cBioPortal fetcher copies RNASeqV2 values without a TPM conversion; verify units before interpreting cutoffs. cBioPortal describes these values as RSEM normalized expression ([FAQ](https://docs.cbioportal.org/user-guide/faq/)). Missing gene-expression entries are treated as zero by the pipeline.
+
+Ensemble runs use a MHCflurry prefilter before remote requests, so some results are MHCflurry-only. Remote failures/defaults can affect combined scores without complete fallback provenance in the exported report. Individual model percentiles describe different outputs, and the combined rank is not calibrated. The bundled TCGA TSV has no sidecar or explicit HLA column; its HLA is inferred from action text. Its 28 affinity-only strong binders and 29 dashboard strong binders use different definitions. See [README.md](README.md#limitations) for scientific scope and provenance limits.
+
 ## Layout
 
 - `dashboard.py`: application factory, API routes, origin/host guards, local entrypoint.
@@ -80,4 +86,4 @@ node --check dashboard_static/charts.js
 node --check dashboard_static/data.js
 ```
 
-Regression tests use temporary directories and include a real subprocess run with a synthetic silent variant, avoiding remote prediction calls or changes to the patient's report. Browser checks cover search, empty results, tier selection, sorting, CSV export, consensus selection, patient switching, new-run completion and desktop/mobile layouts. Full ensemble model inference is not part of the dashboard smoke tests.
+Regression tests use temporary directories and include a real subprocess run with a synthetic variant below the expression cutoff, avoiding remote prediction calls or changes to the patient's report. Manual browser verification scenarios include search, empty results, tier selection, sorting, CSV export, consensus selection, patient switching, new-run completion and desktop/mobile layouts; they are not automated by the pytest suite. Full ensemble model inference is not part of the dashboard smoke tests.
