@@ -43,7 +43,7 @@ MHCflurry's presentation score combines affinity and processing predictions ([of
 
 The CLI uses functions in `src/prioritizer.py` to calculate:
 
-$$S_{neo} = \operatorname{round}\left(\min\left(100, C_{AF} E_{TPM} P_{MHC} A_{bonus} \times 20\right),1\right)$$
+$$S_{neo} = \mathrm{round}\left(\min\left(100, C_{AF} E_{TPM} P_{MHC} A_{bonus} \times 20\right),1\right)$$
 
 These are heuristic weights, not fitted probabilities of T-cell response. Scores can saturate at 100 and are not calibrated for comparisons across patients.
 
