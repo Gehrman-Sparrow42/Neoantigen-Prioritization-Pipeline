@@ -21,6 +21,17 @@ The workflow filters missense variants, resolves protein sequences, generates mu
 
 ## Implemented workflow
 
+```mermaid
+flowchart LR
+    Inputs["Mutation and expression JSON"] --> Filter["Validate and filter missense variants"]
+    Filter --> Protein["Resolve reference protein and check residue"]
+    Protein --> Peptides["Generate paired mutant and wild-type 9-mers"]
+    Peptides --> Predict["Run selected HLA binding or presentation predictors"]
+    Predict --> Rank["Select one peptide per variant and rank"]
+    Rank --> Reports["TSV report and metadata sidecar"]
+    Reports --> Dashboard["Local report dashboard"]
+```
+
 1. **Read and validate JSON inputs.** Mutation records use a cBioPortal-compatible schema with gene identifiers, mutation type, protein change, and tumor alternate/reference read counts. Expression maps Entrez gene IDs to finite, non-negative values. Patient identity is inferred from mutations or supplied explicitly.
 2. **Filter missense variants by expression.** The default cutoff is `1.0`. Missing gene-expression entries are treated as zero and filtered at this cutoff. The code calls this quantity TPM, but users must verify input units; see [limitations](#limitations).
 3. **Resolve protein context.** A local cache or UniProt reviewed human sequence search supplies a gene-level reference sequence. Resolution checks the one-based protein position and reference residue, then extracts up to ten residues on each side. Unresolved sequences, unsupported protein-change strings, out-of-range positions, and residue mismatches share an exclusion counter. Uncached genes are prefetched with up to 16 workers.
@@ -158,19 +169,19 @@ DASHBOARD.md             # Dashboard operation and technical details
 
 ## Quickstart and CLI
 
-Use Python 3.10+ and an environment compatible with the predictor dependencies. In this `C:\Tools` workspace, use the shared environment at `C:\Tools\.venv` by default. From the project directory:
+Use Python 3.10+ and an environment compatible with the predictor dependencies. From the project directory:
 
 ```powershell
-& "C:\Tools\.venv\Scripts\python.exe" -m pip install -r requirements.txt
-& "C:\Tools\.venv\Scripts\python.exe" dashboard.py --open-browser
+python -m pip install -r requirements.txt
+python dashboard.py --open-browser
 ```
 
-On Windows the existing workspace launcher is `C:\Tools\LAUNCHERS\Launch_NeoScorer_Dashboard.bat`. Outside this workspace, substitute your Python interpreter. Installing packages alone does not install MHCflurry model weights; follow the [MHCflurry installation instructions](https://openvax.github.io/mhcflurry/intro.html) for the presentation bundle required by `Class1PresentationPredictor`.
+Installing packages alone does not install MHCflurry model weights; follow the [MHCflurry installation instructions](https://openvax.github.io/mhcflurry/intro.html) for the presentation bundle required by `Class1PresentationPredictor`.
 
 Run the example through the CLI:
 
 ```powershell
-& "C:\Tools\.venv\Scripts\python.exe" run_pipeline.py `
+python run_pipeline.py `
   --mutations data/real_patient_TCGA-D3-A1Q1-06_mutations.json `
   --expression data/real_patient_TCGA-D3-A1Q1-06_expression.json `
   --hla "HLA-A*02:01" --predictor ensemble `
@@ -204,8 +215,8 @@ The separate output directory preserves the bundled report. The CLI replaces exi
 Install development dependencies if needed and run:
 
 ```powershell
-& "C:\Tools\.venv\Scripts\python.exe" -m pip install -r requirements-dev.txt
-& "C:\Tools\.venv\Scripts\python.exe" -m pytest tests/ -q
+python -m pip install -r requirements-dev.txt
+python -m pytest tests/ -q
 ```
 
 Existing tests cover dashboard/API behavior, patient identity, validation, filtering/export, overwrite protection, failed jobs, and a subprocess CLI run with a synthetic variant excluded by expression. They do not establish full ensemble inference correctness, scientific ranking performance, or clinical validity. See [DASHBOARD.md](DASHBOARD.md) for additional static checks and manual browser scenarios.
